@@ -25,7 +25,7 @@ Add to your MCP config:
 ```
 
 > The private key is used to sign x402 payments (EIP-3009, off-chain, zero gas).  
-> Your wallet needs USDC on Base Sepolia. No ETH required.
+> Your wallet needs USDC on Base mainnet. No ETH required.
 
 ## Tools
 
@@ -47,7 +47,8 @@ Add to your MCP config:
 | Variable | Required | Description |
 |---|---|---|
 | `LUXEORACLE_PRIVATE_KEY` | For paid tools | Wallet private key for x402 payments |
-| `LUXEORACLE_BASE_URL` | No | API base URL (default: `https://luxe-oracle.com`) |
+| `LUXEORACLE_SESSION_KEY` | No | Session token from `buy_session`. When set, paid tools spend a session credit and skip per-query x402 payment. |
+| `LUXEORACLE_BASE_URL` | No | API base URL (default: `https://api.luxe-oracle.com`) |
 
 ## Development
 

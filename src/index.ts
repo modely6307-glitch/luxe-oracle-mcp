@@ -4,8 +4,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-const BASE_URL = process.env.LUXEORACLE_BASE_URL || 'https://luxe-oracle.com';
+const BASE_URL = process.env.LUXEORACLE_BASE_URL || 'https://api.luxe-oracle.com';
 const PRIVATE_KEY = process.env.LUXEORACLE_PRIVATE_KEY || '';
+const SESSION_KEY = process.env.LUXEORACLE_SESSION_KEY || '';
 
 // ---------------------------------------------------------------------------
 // x402 payment wrapper — lazily initialized
@@ -22,15 +23,53 @@ async function getFetchWithPayment(): Promise<typeof fetch> {
     );
   }
 
-  const { wrapFetchWithPayment, x402Client } = await import('@x402/fetch');
+  const { wrapFetchWithPaymentFromConfig } = await import('@x402/fetch');
   const { ExactEvmScheme } = await import('@x402/evm/exact/client');
+  const { toClientEvmSigner } = await import('@x402/evm');
   const { privateKeyToAccount } = await import('viem/accounts');
+  const { createPublicClient, http } = await import('viem');
+  const { base } = await import('viem/chains');
 
   const account = privateKeyToAccount(PRIVATE_KEY as `0x${string}`);
-  const client = new x402Client();
-  client.register('eip155:*', new ExactEvmScheme(account));
-  _fetchWithPayment = wrapFetchWithPayment(fetch, client);
+  const publicClient = createPublicClient({ chain: base, transport: http() });
+  const signer = toClientEvmSigner(
+    {
+      address: account.address,
+      signTypedData: (msg) => account.signTypedData(msg as Parameters<typeof account.signTypedData>[0]),
+    },
+    publicClient,
+  );
+  _fetchWithPayment = wrapFetchWithPaymentFromConfig(fetch, {
+    schemes: [{ network: 'eip155:8453', client: new ExactEvmScheme(signer) }],
+  });
   return _fetchWithPayment;
+}
+
+/**
+ * Decode the base64-encoded x-payment-response header into the settle result
+ * (so we can surface the on-chain tx hash to the agent for verification).
+ */
+function decodePaymentResponse(header: string | null): { transaction?: string; payer?: string } | null {
+  if (!header) return null;
+  try {
+    return JSON.parse(Buffer.from(header, 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Call a paid endpoint. If LUXEORACLE_SESSION_KEY is set, send X-Session-Key
+ * to consume a pre-paid credit; otherwise pay per request via x402.
+ */
+async function paidCall(url: string, init?: RequestInit): Promise<Response> {
+  if (SESSION_KEY) {
+    const headers = new Headers(init?.headers);
+    headers.set('X-Session-Key', SESSION_KEY);
+    return fetch(url, { ...init, headers });
+  }
+  const paid = await getFetchWithPayment();
+  return paid(url, init);
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +94,7 @@ server.registerTool(
       'This tool is FREE — no payment required.',
     inputSchema: z.object({
       brand: z.string().default('hermes').describe('Brand to query (default: hermes)'),
-      region: z.string().optional().describe('Region code (e.g. tw, sg). Omit to list supported regions.'),
+      region: z.string().optional().describe('Region code (e.g. tw, sg, jp, uk). Omit to list supported regions.'),
     }),
   },
   async ({ brand, region }) => {
@@ -102,7 +141,7 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// Tool: check_stock (PAID — $0.005 USDC via x402)
+// Tool: check_stock (PAID — $0.005 USDC via x402, or 1 session credit)
 // ---------------------------------------------------------------------------
 server.registerTool(
   'check_stock',
@@ -111,16 +150,15 @@ server.registerTool(
     description:
       'Check real-time stock status for a specific Hermès product by ID. ' +
       'The product ID must come from browse_inventory first. ' +
-      'COST: $0.005 USDC per query (paid automatically via x402, zero gas).',
+      'COST: $0.005 USDC via x402 (zero gas), or 1 credit if LUXEORACLE_SESSION_KEY is set.',
     inputSchema: z.object({
-      region: z.string().describe('Region code (e.g. tw, sg)'),
+      region: z.string().describe('Region code (e.g. tw, sg, jp, uk)'),
       brand: z.string().default('hermes').describe('Brand name (default: hermes)'),
       id: z.string().describe('Product ID from browse_inventory (e.g. H086962CK0G)'),
     }),
   },
   async ({ region, brand, id }) => {
-    const paidFetch = await getFetchWithPayment();
-    const res = await paidFetch(`${BASE_URL}/api/v1/monitor/${region}/${brand}/${id}`);
+    const res = await paidCall(`${BASE_URL}/api/v1/monitor/${region}/${brand}/${id}`);
     const data = await res.json();
 
     if (res.status === 404) {
@@ -150,6 +188,13 @@ server.registerTool(
       };
     }
 
+    const settle = decodePaymentResponse(res.headers.get('x-payment-response'));
+    const paymentLine = SESSION_KEY
+      ? '(paid via session credit)'
+      : settle?.transaction
+        ? `(paid via x402 — tx ${settle.transaction})`
+        : '';
+
     const stockEmoji = data.in_stock ? '✅ IN STOCK' : '❌ OUT OF STOCK';
     return {
       content: [{
@@ -158,7 +203,8 @@ server.registerTool(
               `Product: ${data.metadata?.title || id}\n` +
               `Region: ${data.region}\n` +
               `Last updated: ${data.last_update}\n` +
-              `Source: ${data.metadata?.source_url || 'N/A'}`,
+              `Source: ${data.metadata?.source_url || 'N/A'}` +
+              (paymentLine ? `\n\n${paymentLine}` : ''),
       }],
     };
   },
@@ -183,6 +229,7 @@ server.registerTool(
     const data = await res.json();
 
     if (res.status === 201 || data.sessionToken) {
+      const settle = decodePaymentResponse(res.headers.get('x-payment-response'));
       return {
         content: [{
           type: 'text' as const,
@@ -190,7 +237,8 @@ server.registerTool(
                 `Session Token: ${data.sessionToken}\n` +
                 `Credits: ${data.credits}\n` +
                 `Expires: ${data.expiresAt}\n\n` +
-                `Set this as your LUXEORACLE_SESSION_KEY environment variable to use session-based auth.`,
+                `Set this as your LUXEORACLE_SESSION_KEY environment variable to use session-based auth.` +
+                (settle?.transaction ? `\n\n(paid via x402 — tx ${settle.transaction})` : ''),
         }],
       };
     }
